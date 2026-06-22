@@ -691,25 +691,37 @@ if menu == "Dashboard":
                 st.info(f"Nessun inventario salvato per {store}.")
                 continue
             ultimo["quantita"] = pd.to_numeric(ultimo["quantita"], errors="coerce").fillna(0)
-            valorizzato = ultimo.merge(
-                ref[["codice", "prezzo_unitario", "scorta_minima"]],
-                on="codice",
-                how="left",
-                suffixes=("", "_anagrafica")
-            )
+            # Merge robusto: rinomino i prezzi anagrafica prima del merge per evitare
+            # colonne duplicate o tipi misti che possono mandare in errore Pandas.
+            ref_merge = ref[["codice", "prezzo_unitario", "scorta_minima"]].copy()
+            ref_merge = ref_merge.rename(columns={
+                "prezzo_unitario": "prezzo_unitario_anagrafica",
+                "scorta_minima": "scorta_minima_anagrafica"
+            })
+            valorizzato = ultimo.merge(ref_merge, on="codice", how="left")
 
-            # Compatibilità: se gli inventari hanno già una colonna prezzo_unitario
-            # uso quella; se è vuota, uso il prezzo dell'anagrafica.
-            if "prezzo_unitario" not in valorizzato.columns:
-                valorizzato["prezzo_unitario"] = 0
-            if "prezzo_unitario_anagrafica" in valorizzato.columns:
-                prezzo_inv = pd.to_numeric(valorizzato["prezzo_unitario"], errors="coerce")
-                prezzo_ana = pd.to_numeric(valorizzato["prezzo_unitario_anagrafica"], errors="coerce")
-                valorizzato["prezzo_unitario"] = prezzo_inv.fillna(0)
-                valorizzato.loc[valorizzato["prezzo_unitario"] == 0, "prezzo_unitario"] = prezzo_ana.fillna(0)
+            # Prezzo: prima uso quello salvato nell'inventario, se presente e > 0;
+            # altrimenti uso quello dell'anagrafica.
+            if "prezzo_unitario" in valorizzato.columns:
+                prezzo_inv = pd.to_numeric(valorizzato["prezzo_unitario"], errors="coerce").fillna(0)
+            else:
+                prezzo_inv = pd.Series(0, index=valorizzato.index, dtype="float64")
+            prezzo_ana = pd.to_numeric(valorizzato.get("prezzo_unitario_anagrafica", 0), errors="coerce")
+            if not isinstance(prezzo_ana, pd.Series):
+                prezzo_ana = pd.Series(0, index=valorizzato.index, dtype="float64")
+            prezzo_ana = prezzo_ana.fillna(0)
+            valorizzato["prezzo_unitario"] = prezzo_inv.where(prezzo_inv > 0, prezzo_ana).astype(float)
 
-            valorizzato["prezzo_unitario"] = pd.to_numeric(valorizzato["prezzo_unitario"], errors="coerce").fillna(0)
-            valorizzato["scorta_minima"] = pd.to_numeric(valorizzato["scorta_minima"], errors="coerce").fillna(0)
+            # Scorta minima: stessa logica, ma se manca uso zero.
+            if "scorta_minima" in valorizzato.columns:
+                scorta_inv = pd.to_numeric(valorizzato["scorta_minima"], errors="coerce").fillna(0)
+            else:
+                scorta_inv = pd.Series(0, index=valorizzato.index, dtype="float64")
+            scorta_ana = pd.to_numeric(valorizzato.get("scorta_minima_anagrafica", 0), errors="coerce")
+            if not isinstance(scorta_ana, pd.Series):
+                scorta_ana = pd.Series(0, index=valorizzato.index, dtype="float64")
+            scorta_ana = scorta_ana.fillna(0)
+            valorizzato["scorta_minima"] = scorta_inv.where(scorta_inv > 0, scorta_ana).astype(float)
             valorizzato["valore"] = valorizzato["quantita"] * valorizzato["prezzo_unitario"]
             valore_store = valorizzato["valore"].sum(); totale_generale += valore_store
             food_valore = valorizzato[valorizzato["tipo"].astype(str).str.lower() == "food"]["valore"].sum()
@@ -1248,6 +1260,7 @@ elif menu == "Export":
         st.download_button("Scarica inventari Excel", excel_bytes({"Inventari": inv_xlsx}), "tup_inventari.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Scarica trasferimenti Excel", excel_bytes({"Trasferimenti": tr_xlsx}), "tup_trasferimenti.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Scarica acquisti fatture CSV", acquisti.to_csv(index=False).encode("utf-8"), "tup_acquisti_fatture.csv", "text/csv")
+
 
 
 
