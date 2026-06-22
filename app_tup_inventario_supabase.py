@@ -284,6 +284,112 @@ def aggiorna_prezzo_medio_mese(codice_interno, mese, anno):
     if not hit.empty:
         update_row("referenze", hit.iloc[0]["id"], {"prezzo_unitario": prezzo_medio})
 
+
+
+def aggiorna_prezzi_medi_per_codice(codice_interno):
+    acquisti = fetch_table("acquisti_fatture")
+    if acquisti.empty:
+        return
+    df = acquisti[acquisti["codice_interno"].astype(str) == str(codice_interno)].copy()
+    if df.empty:
+        return
+    for _, r in df[["mese", "anno"]].drop_duplicates().iterrows():
+        try:
+            aggiorna_prezzo_medio_mese(codice_interno, int(r["mese"]), int(r["anno"]))
+        except Exception:
+            pass
+
+
+def aggiorna_alias_e_acquisti(alias_id, nuovo_codice, nuova_referenza):
+    """Collega un alias fornitore a un prodotto interno e riallinea gli acquisti già registrati."""
+    alias = fetch_table("fornitori_referenze")
+    if alias.empty:
+        return 0
+    hit = alias[alias["id"].astype(str) == str(alias_id)]
+    if hit.empty:
+        return 0
+    r = hit.iloc[0]
+    fornitore = str(r.get("fornitore", ""))
+    codice_fornitore = str(r.get("codice_fornitore", ""))
+    descrizione = str(r.get("descrizione_fornitore", ""))
+    update_row("fornitori_referenze", alias_id, {"codice_interno": str(nuovo_codice)})
+
+    q = sb().table("acquisti_fatture").update({
+        "codice_interno": str(nuovo_codice),
+        "referenza_interna": str(nuova_referenza),
+    }).eq("fornitore", fornitore)
+    if codice_fornitore:
+        q = q.eq("codice_fornitore", codice_fornitore)
+    else:
+        q = q.eq("descrizione_fornitore", descrizione)
+    q.execute()
+    aggiorna_prezzi_medi_per_codice(nuovo_codice)
+    return 1
+
+
+def accorpa_prodotti(codice_da, codice_a):
+    """Sposta inventari, trasferimenti, acquisti e alias da un prodotto duplicato a quello principale."""
+    codice_da = str(codice_da)
+    codice_a = str(codice_a)
+    if not codice_da or not codice_a or codice_da == codice_a:
+        raise ValueError("Scegli due prodotti diversi.")
+
+    referenze = fetch_table("referenze")
+    if referenze.empty:
+        raise ValueError("Nessuna referenza trovata.")
+    src = referenze[referenze["codice"].astype(str) == codice_da]
+    dst = referenze[referenze["codice"].astype(str) == codice_a]
+    if src.empty or dst.empty:
+        raise ValueError("Prodotto di origine o destinazione non trovato.")
+    src = src.iloc[0]
+    dst = dst.iloc[0]
+    nuova_referenza = str(dst.get("referenza", ""))
+    nuovo_tipo = str(dst.get("tipo", "Food"))
+    nuova_categoria = str(dst.get("categoria", "Altro"))
+    nuova_unita = str(dst.get("unita", "pz"))
+
+    # Creo un alias anche per la vecchia referenza, così resta memoria del collegamento.
+    try:
+        upsert_alias(
+            codice_a,
+            src.get("fornitore", ""),
+            src.get("codice_fornitore", ""),
+            src.get("referenza", ""),
+            src.get("unita", nuova_unita),
+            src.get("prezzo_unitario", 0),
+        )
+    except Exception:
+        pass
+
+    # Riallineo tutti i movimenti storici.
+    sb().table("inventari").update({
+        "codice": codice_a, "referenza": nuova_referenza,
+        "tipo": nuovo_tipo, "categoria": nuova_categoria, "unita": nuova_unita,
+    }).eq("codice", codice_da).execute()
+
+    sb().table("trasferimenti").update({
+        "codice": codice_a, "referenza": nuova_referenza,
+        "tipo": nuovo_tipo, "categoria": nuova_categoria, "unita": nuova_unita,
+    }).eq("codice", codice_da).execute()
+
+    try:
+        sb().table("acquisti_fatture").update({
+            "codice_interno": codice_a,
+            "referenza_interna": nuova_referenza,
+        }).eq("codice_interno", codice_da).execute()
+    except Exception:
+        pass
+
+    try:
+        sb().table("fornitori_referenze").update({"codice_interno": codice_a}).eq("codice_interno", codice_da).execute()
+    except Exception:
+        pass
+
+    # Non cancelliamo: lo disattiviamo, così non lo vedi in inventario ma resta audit.
+    update_row("referenze", src["id"], {"attivo": "no", "fornitore": "ACCORPATO", "codice_fornitore": codice_a})
+    aggiorna_prezzi_medi_per_codice(codice_a)
+    return nuova_referenza
+
 # =========================
 # LETTURA FATTURE
 # =========================
@@ -645,7 +751,11 @@ elif menu == "Import fatture":
 
 elif menu == "Anagrafica referenze":
     st.subheader("Anagrafica prodotti interni")
-    tab1, tab2, tab3, tab4 = st.tabs(["Aggiungi prodotto", "Tabella prodotti", "Alias fornitori", "Elimina refusi"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "Aggiungi prodotto", "Tabella prodotti", "Alias fornitori",
+        "Associa manualmente", "Accorpa prodotti", "Elimina refusi"
+    ])
+
     with tab1:
         with st.form("form_referenza"):
             referenza = st.text_input("Prodotto interno")
@@ -663,6 +773,8 @@ elif menu == "Anagrafica referenze":
                     codice = genera_codice(nome, referenze)
                     insert_rows("referenze", [{"codice": codice, "referenza": nome, "tipo": tipo, "categoria": categoria, "unita": unita, "fornitore": "MULTI", "codice_fornitore": "", "prezzo_unitario": prezzo, "ultima_quantita": 0.0, "ultimo_importo": 0.0, "iva": "", "scorta_minima": scorta_minima, "attivo": "si"}])
                     st.success("Prodotto interno aggiunto.")
+                    st.rerun()
+
     with tab2:
         referenze = fetch_table("referenze")
         if referenze.empty:
@@ -679,6 +791,7 @@ elif menu == "Anagrafica referenze":
                         continue
                     update_row("referenze", row["id"], {"codice": str(row.get("codice", "")), "referenza": str(row.get("referenza", "")), "tipo": str(row.get("tipo", "Food")), "categoria": str(row.get("categoria", "Altro")), "unita": str(row.get("unita", "pz")), "fornitore": str(row.get("fornitore", "MULTI")), "codice_fornitore": str(row.get("codice_fornitore", "")), "prezzo_unitario": pulisci_numero(row.get("prezzo_unitario", 0)), "ultima_quantita": pulisci_numero(row.get("ultima_quantita", 0)), "ultimo_importo": pulisci_numero(row.get("ultimo_importo", 0)), "iva": str(row.get("iva", "")), "scorta_minima": pulisci_numero(row.get("scorta_minima", 0)), "attivo": str(row.get("attivo", "si"))})
                 st.success("Anagrafica salvata.")
+
     with tab3:
         alias = fetch_table("fornitori_referenze")
         st.caption("Qui vedi come le descrizioni/codici dei fornitori vengono collegati ai prodotti interni.")
@@ -686,7 +799,94 @@ elif menu == "Anagrafica referenze":
             st.info("Nessun alias fornitore ancora registrato.")
         else:
             st.dataframe(alias.sort_values(["fornitore", "descrizione_fornitore"]), use_container_width=True)
+
     with tab4:
+        st.markdown("### Associa manualmente alias fornitore → prodotto interno")
+        st.info("Usa questa scheda quando una riga fattura è finita sul prodotto sbagliato. Cambi il prodotto interno e il sistema riallinea anche gli acquisti già registrati per quel codice fornitore.")
+        referenze = fetch_table("referenze")
+        alias = fetch_table("fornitori_referenze")
+        if referenze.empty or alias.empty:
+            st.info("Servono prodotti interni e almeno un alias fornitore registrato.")
+        else:
+            ref_attive = referenze[referenze["attivo"].astype(str).str.lower() != "no"].copy() if "attivo" in referenze.columns else referenze.copy()
+            ref_attive = ref_attive.sort_values("referenza")
+            label_to_codice = {label_ref(r): str(r.get("codice", "")) for _, r in ref_attive.iterrows()}
+            codice_to_label = {str(r.get("codice", "")): label_ref(r) for _, r in ref_attive.iterrows()}
+            codice_to_nome = {str(r.get("codice", "")): str(r.get("referenza", "")) for _, r in ref_attive.iterrows()}
+            options = list(label_to_codice.keys())
+
+            cerca_alias = st.text_input("Cerca alias / fornitore", key="cerca_alias_associa")
+            work = alias.copy()
+            for col in ["id", "codice_interno", "fornitore", "codice_fornitore", "descrizione_fornitore", "unita", "ultimo_prezzo"]:
+                if col not in work.columns:
+                    work[col] = ""
+            work["prodotto_interno"] = work["codice_interno"].astype(str).map(codice_to_label).fillna("")
+            if cerca_alias:
+                work = work[work.astype(str).apply(lambda row: row.str.lower().str.contains(cerca_alias.lower()).any(), axis=1)]
+            work = work[["id", "fornitore", "codice_fornitore", "descrizione_fornitore", "unita", "ultimo_prezzo", "prodotto_interno"]].sort_values(["fornitore", "descrizione_fornitore"])
+            edited_alias = st.data_editor(
+                work,
+                use_container_width=True,
+                hide_index=True,
+                disabled=["id", "fornitore", "codice_fornitore", "descrizione_fornitore", "unita", "ultimo_prezzo"],
+                column_config={"prodotto_interno": st.column_config.SelectboxColumn("prodotto interno corretto", options=options)},
+                key="associa_alias_editor",
+            )
+            if st.button("Salva associazioni manuali"):
+                modifiche = 0
+                errori = []
+                originale = work.set_index("id")["prodotto_interno"].to_dict()
+                for _, row in edited_alias.iterrows():
+                    try:
+                        aid = row.get("id")
+                        nuovo_label = str(row.get("prodotto_interno", ""))
+                        if not aid or not nuovo_label or nuovo_label == str(originale.get(aid, "")):
+                            continue
+                        nuovo_codice = label_to_codice.get(nuovo_label, "")
+                        nuova_ref = codice_to_nome.get(nuovo_codice, "")
+                        if nuovo_codice:
+                            aggiorna_alias_e_acquisti(aid, nuovo_codice, nuova_ref)
+                            modifiche += 1
+                    except Exception as e:
+                        errori.append(str(e))
+                if errori:
+                    st.warning("Alcune associazioni non sono state salvate: " + " | ".join(errori[:5]))
+                st.success(f"Associazioni aggiornate: {modifiche}")
+                if modifiche:
+                    st.rerun()
+
+    with tab5:
+        st.markdown("### Accorpa prodotti duplicati")
+        st.warning("Questa funzione sposta inventari, trasferimenti, acquisti e alias dal prodotto duplicato al prodotto principale. Il duplicato viene disattivato, non cancellato.")
+        referenze = fetch_table("referenze")
+        if referenze.empty or len(referenze) < 2:
+            st.info("Servono almeno due prodotti per fare un accorpamento.")
+        else:
+            ref_sorted = referenze.sort_values("referenza").copy()
+            labels_all = [label_ref(r) for _, r in ref_sorted.iterrows()]
+            label_to_codice_all = {label_ref(r): str(r.get("codice", "")) for _, r in ref_sorted.iterrows()}
+            col_a, col_b = st.columns(2)
+            with col_a:
+                da_label = st.selectbox("Prodotto duplicato da accorpare", labels_all, key="merge_da")
+            with col_b:
+                a_label = st.selectbox("Prodotto principale da mantenere", labels_all, key="merge_a")
+            conferma_merge = st.checkbox("Confermo che voglio accorpare questi due prodotti", key="conferma_merge")
+            if st.button("Accorpa prodotti"):
+                codice_da = label_to_codice_all.get(da_label, "")
+                codice_a = label_to_codice_all.get(a_label, "")
+                if codice_da == codice_a:
+                    st.error("Hai selezionato lo stesso prodotto due volte.")
+                elif not conferma_merge:
+                    st.error("Devi confermare l'accorpamento.")
+                else:
+                    try:
+                        nome_finale = accorpa_prodotti(codice_da, codice_a)
+                        st.success(f"Accorpamento completato. Tutto è stato spostato su: {nome_finale}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Errore accorpamento: {e}")
+
+    with tab6:
         st.warning("Elimina solo refusi. La cancellazione rimuove anche inventari, trasferimenti, alias e acquisti collegati.")
         referenze = fetch_table("referenze")
         if referenze.empty:
