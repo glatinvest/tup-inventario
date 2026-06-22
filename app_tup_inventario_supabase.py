@@ -952,14 +952,34 @@ elif menu == "Inventario mensile":
                 base.insert(0, "punto_vendita", store); base["quantita"] = 0.0; base["note"] = ""
                 esistente = inventari[(inventari["data_inventario"].astype(str) == data_str) & (inventari["punto_vendita"].astype(str) == store)].copy() if not inventari.empty else pd.DataFrame()
                 if not esistente.empty:
-                    base = base.drop(columns=["quantita", "note"]).merge(esistente[["codice", "quantita", "note"]], on="codice", how="left")
-                    base["quantita"] = pd.to_numeric(base["quantita"], errors="coerce").fillna(0); base["note"] = base["note"].fillna("")
+                    # Mantiene anche l'unità di misura salvata nell'inventario, perché a volte
+                    # si acquista a cartoni/confezioni ma si conta o trasferisce a pezzi.
+                    cols_esistente = [c for c in ["codice", "quantita", "note", "unita"] if c in esistente.columns]
+                    esistente_small = esistente[cols_esistente].copy()
+                    if "unita" in esistente_small.columns:
+                        esistente_small = esistente_small.rename(columns={"unita": "unita_salvata"})
+                    base = base.drop(columns=["quantita", "note"]).merge(esistente_small, on="codice", how="left")
+                    base["quantita"] = pd.to_numeric(base["quantita"], errors="coerce").fillna(0)
+                    base["note"] = base["note"].fillna("") if "note" in base.columns else ""
+                    if "unita_salvata" in base.columns:
+                        base["unita"] = base["unita_salvata"].fillna(base["unita"])
+                        base = base.drop(columns=["unita_salvata"], errors="ignore")
                 filtro_tipo = st.selectbox("Tipo", ["Tutti"] + TIPI, key=f"tipo_inv_{store}")
                 filtro_categoria = st.multiselect("Categoria", sorted(attive["categoria"].dropna().unique().tolist()), key=f"cat_inv_{store}")
                 tabella = base.copy()
                 if filtro_tipo != "Tutti": tabella = tabella[tabella["tipo"] == filtro_tipo]
                 if filtro_categoria: tabella = tabella[tabella["categoria"].isin(filtro_categoria)]
-                edited = st.data_editor(tabella, use_container_width=True, hide_index=True, disabled=["punto_vendita", "codice", "referenza", "tipo", "categoria", "unita"], column_config={"quantita": st.column_config.NumberColumn("Quantità", min_value=0.0, step=0.1)}, key=f"inventario_{data_str}_{store}")
+                edited = st.data_editor(
+                    tabella,
+                    use_container_width=True,
+                    hide_index=True,
+                    disabled=["punto_vendita", "codice", "referenza", "tipo", "categoria"],
+                    column_config={
+                        "unita": st.column_config.SelectboxColumn("Unità", options=UNITA),
+                        "quantita": st.column_config.NumberColumn("Quantità", min_value=0.0, step=0.1),
+                    },
+                    key=f"inventario_{data_str}_{store}",
+                )
                 edited_tables.append(edited)
         if st.button("Salva inventario mensile"):
             edited_all = pd.concat(edited_tables, ignore_index=True) if edited_tables else pd.DataFrame()
@@ -1009,13 +1029,16 @@ elif menu == "Trasferimenti merci":
             if filtro_categoria != "Tutte": rf = rf[rf["categoria"] == filtro_categoria]
             referenza_sel = st.selectbox("Prodotto", rf["referenza"].tolist())
             riga = rf[rf["referenza"] == referenza_sel].iloc[0]
+            unita_default = str(riga.get("unita", "pz"))
+            unita_index = UNITA.index(unita_default) if unita_default in UNITA else 0
+            unita_trasferimento = st.selectbox("Unità trasferimento", UNITA, index=unita_index)
             quantita = st.number_input("Quantità", min_value=0.0, step=0.1)
             note = st.text_input("Note")
             salva = st.form_submit_button("Salva trasferimento")
             if salva:
                 if quantita <= 0: st.error("Inserisci una quantità maggiore di zero.")
                 else:
-                    insert_rows("trasferimenti", [{"data_trasferimento": data_trasferimento.strftime("%Y-%m-%d"), "da_punto_vendita": da_store, "a_punto_vendita": a_store, "codice": str(riga["codice"]), "referenza": str(riga["referenza"]), "tipo": str(riga["tipo"]), "categoria": str(riga["categoria"]), "unita": str(riga["unita"]), "quantita": quantita, "note": note}])
+                    insert_rows("trasferimenti", [{"data_trasferimento": data_trasferimento.strftime("%Y-%m-%d"), "da_punto_vendita": da_store, "a_punto_vendita": a_store, "codice": str(riga["codice"]), "referenza": str(riga["referenza"]), "tipo": str(riga["tipo"]), "categoria": str(riga["categoria"]), "unita": str(unita_trasferimento), "quantita": quantita, "note": note}])
                     st.success("Trasferimento salvato.")
         trasferimenti = fetch_table("trasferimenti")
         if not trasferimenti.empty:
@@ -1062,4 +1085,5 @@ elif menu == "Export":
     with col2:
         st.download_button("Scarica inventari CSV", inventari.to_csv(index=False).encode("utf-8"), "tup_inventari.csv", "text/csv")
         st.download_button("Scarica acquisti fatture CSV", acquisti.to_csv(index=False).encode("utf-8"), "tup_acquisti_fatture.csv", "text/csv")
+
 
