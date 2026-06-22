@@ -179,6 +179,27 @@ def ultimo_inventario_per_store(inventari, store):
     return df[df["data_inventario"].astype(str) == data_ultima].copy(), data_ultima
 
 
+
+def dedup_inventari_latest(df):
+    """Tiene una sola riga per data/punto vendita/codice, usando la riga più recente per id/created_at."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    for col in ["data_inventario", "punto_vendita", "codice"]:
+        if col not in out.columns:
+            return out
+    if "id" in out.columns:
+        out["_sort_id"] = pd.to_numeric(out["id"], errors="coerce").fillna(0)
+    else:
+        out["_sort_id"] = 0
+    if "created_at" in out.columns:
+        out["_sort_created"] = out["created_at"].astype(str)
+    else:
+        out["_sort_created"] = ""
+    out = out.sort_values(["data_inventario", "punto_vendita", "codice", "_sort_created", "_sort_id"])
+    out = out.drop_duplicates(subset=["data_inventario", "punto_vendita", "codice"], keep="last")
+    return out.drop(columns=["_sort_id", "_sort_created"], errors="ignore")
+
 def label_ref(row):
     return f'{row.get("referenza", "")} | {row.get("codice", "")}'
 
@@ -912,14 +933,16 @@ elif menu == "Anagrafica referenze":
 
 elif menu == "Inventario mensile":
     st.subheader("Inventario mensile")
-    referenze = fetch_table("referenze"); inventari = fetch_table("inventari")
+    referenze = fetch_table("referenze"); inventari = dedup_inventari_latest(fetch_table("inventari"))
     if referenze.empty:
         st.info("Prima inserisci o importa i prodotti.")
     else:
         data_inventario = st.date_input("Data inventario", value=date.today())
         data_str = data_inventario.strftime("%Y-%m-%d"); mese = data_inventario.month; anno = data_inventario.year
         st.caption(f"Inventario del mese: {mese:02d}/{anno}")
+        st.info("Quando salvi, l’inventario di quel giorno e punto vendita viene sostituito, non duplicato.")
         attive = referenze[referenze["attivo"].astype(str).str.lower() != "no"].copy().sort_values(["tipo", "categoria", "referenza"])
+        attive = attive.drop_duplicates(subset=["codice"], keep="last")
         store_tabs = st.tabs(stores_visibili())
         edited_tables = []
         for tab, store in zip(store_tabs, stores_visibili()):
@@ -949,7 +972,7 @@ elif menu == "Inventario mensile":
                 insert_rows("inventari", rows)
                 st.success("Inventario mensile salvato.")
         st.divider(); st.subheader("Inventari salvati")
-        inventari = fetch_table("inventari")
+        inventari = dedup_inventari_latest(fetch_table("inventari"))
         if inventari.empty:
             st.info("Nessun inventario salvato.")
         else:
@@ -970,6 +993,7 @@ elif menu == "Trasferimenti merci":
         st.info("Prima inserisci o importa i prodotti.")
     else:
         attive = referenze[referenze["attivo"].astype(str).str.lower() != "no"].copy().sort_values(["tipo", "categoria", "referenza"])
+        attive = attive.drop_duplicates(subset=["codice"], keep="last")
         with st.form("form_trasferimento"):
             data_trasferimento = st.date_input("Data trasferimento", value=date.today())
             col1, col2 = st.columns(2)
@@ -1030,7 +1054,7 @@ elif menu == "Acquisti e prezzi medi":
 
 elif menu == "Export":
     st.subheader("Export")
-    referenze = fetch_table("referenze"); inventari = fetch_table("inventari"); alias = fetch_table("fornitori_referenze"); acquisti = fetch_table("acquisti_fatture")
+    referenze = fetch_table("referenze"); inventari = dedup_inventari_latest(fetch_table("inventari")); alias = fetch_table("fornitori_referenze"); acquisti = fetch_table("acquisti_fatture")
     col1, col2 = st.columns(2)
     with col1:
         st.download_button("Scarica prodotti interni CSV", referenze.to_csv(index=False).encode("utf-8"), "tup_prodotti_interni.csv", "text/csv")
@@ -1038,3 +1062,4 @@ elif menu == "Export":
     with col2:
         st.download_button("Scarica inventari CSV", inventari.to_csv(index=False).encode("utf-8"), "tup_inventari.csv", "text/csv")
         st.download_button("Scarica acquisti fatture CSV", acquisti.to_csv(index=False).encode("utf-8"), "tup_acquisti_fatture.csv", "text/csv")
+
