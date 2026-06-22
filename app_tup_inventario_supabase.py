@@ -3,6 +3,7 @@ import pandas as pd
 from datetime import date
 import re
 import tempfile
+import io
 import xml.etree.ElementTree as ET
 
 try:
@@ -22,7 +23,7 @@ CATEGORIE = [
     "Carne", "Pane", "Formaggi", "Salumi", "Verdure", "Salse", "Fritti",
     "Packaging", "Bevande", "Pulizia", "Altro",
 ]
-UNITA = ["kg", "g", "pz", "conf", "lt", "ml", "CT", "TA", "CF", "NR"]
+UNITA = ["kg", "g", "pz", "conf", "lt", "ml", "CT", "cartone", "TA", "CF", "NR"]
 TIPI = ["Food", "No Food"]
 PUNTI_VENDITA = ["De Cosmi", "Via Roma"]
 
@@ -122,6 +123,72 @@ def pulisci_numero(valore):
     except Exception:
         return 0.0
 
+
+
+def rileva_pezzi_cartone(descrizione):
+    """Prova a capire da descrizioni tipo P/50, PZ 24, X 12, 12PZ quanti pezzi contiene un cartone/confezione."""
+    s = str(descrizione).upper().replace('\'', ' ').replace('°', ' ')
+    patterns = [
+        r"(?:P\s*/\s*|PZ\s*/\s*|PZ\s+|PZ\.|CONF\s+|P\s+)\s*(\d{1,4})\b",
+        r"\b(\d{1,4})\s*(?:PZ|PCS|PEZZI)\b",
+        r"\bX\s*(\d{1,4})\b",
+        r"\b(\d{1,4})\s*X\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, s)
+        if m:
+            n = pulisci_numero(m.group(1))
+            if 1 < n <= 1000:
+                return float(n)
+    return 0.0
+
+
+def prezzo_singolo_da_cartone(prezzo, pezzi):
+    prezzo = pulisci_numero(prezzo); pezzi = pulisci_numero(pezzi)
+    return prezzo / pezzi if prezzo > 0 and pezzi > 0 else 0.0
+
+
+def prepara_df_excel(df):
+    out = df.copy() if df is not None else pd.DataFrame()
+    if out.empty:
+        return out
+    for c in out.columns:
+        if 'created_at' in c:
+            out[c] = out[c].astype(str)
+    return out
+
+
+def excel_bytes(sheets):
+    bio = io.BytesIO()
+    try:
+        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+            for name, df in sheets.items():
+                prepara_df_excel(df).to_excel(writer, sheet_name=str(name)[:31], index=False)
+        return bio.getvalue()
+    except Exception:
+        bio = io.BytesIO()
+        with pd.ExcelWriter(bio) as writer:
+            for name, df in sheets.items():
+                prepara_df_excel(df).to_excel(writer, sheet_name=str(name)[:31], index=False)
+        return bio.getvalue()
+
+
+def aggiungi_prezzi_referenze(df, referenze):
+    out = df.copy()
+    if out.empty or referenze.empty:
+        return out
+    ref = referenze.copy()
+    for c in ["prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]:
+        if c not in ref.columns:
+            ref[c] = 0
+    cols = ["codice", "prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]
+    out = out.merge(ref[cols].drop_duplicates("codice", keep="last"), on="codice", how="left")
+    for c in ["quantita", "prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
+    out["prezzo_applicato"] = out.apply(lambda r: r.get("prezzo_unitario_pz",0) if str(r.get("unita","")).lower() in ["pz", "nr"] and r.get("prezzo_unitario_pz",0)>0 else r.get("prezzo_unitario",0), axis=1)
+    out["valore"] = out["quantita"] * out["prezzo_applicato"]
+    return out
 
 def genera_codice(nome, df):
     base = "".join([c for c in str(nome).upper() if c.isalnum()])[:8] or "REF"
@@ -263,7 +330,7 @@ def upsert_alias(codice_interno, fornitore, codice_fornitore, descrizione, unita
         update_row("fornitori_referenze", hit.iloc[0]["id"], valori)
 
 
-def registra_acquisto(data_acquisto, fornitore, codice_interno, referenza_interna, descrizione_fornitore, codice_fornitore, quantita, unita, prezzo, importo, iva, nome_file=""):
+def registra_acquisto(data_acquisto, fornitore, codice_interno, referenza_interna, descrizione_fornitore, codice_fornitore, quantita, unita, prezzo, importo, iva, nome_file="", pezzi_per_cartone=0, prezzo_unitario_pz=0):
     insert_rows("acquisti_fatture", [{
         "data_acquisto": str(data_acquisto),
         "mese": pd.to_datetime(str(data_acquisto)).month,
@@ -279,6 +346,8 @@ def registra_acquisto(data_acquisto, fornitore, codice_interno, referenza_intern
         "importo": pulisci_numero(importo),
         "iva": str(iva),
         "nome_file": str(nome_file),
+        "pezzi_per_cartone": pulisci_numero(pezzi_per_cartone),
+        "prezzo_unitario_pz": pulisci_numero(prezzo_unitario_pz),
     }])
 
 
@@ -695,7 +764,9 @@ elif menu == "Import fatture":
                 df["prodotto_interno"] = NUOVO_PRODOTTO
             if "scorta_minima" not in df.columns:
                 df["scorta_minima"] = 0.0
-            colonne = ["importa", "prodotto_interno", "referenza", "tipo", "categoria", "unita", "fornitore", "codice_fornitore", "prezzo_unitario", "ultima_quantita", "ultimo_importo", "iva", "scorta_minima", "attivo", "nome_file"]
+            df["pezzi_per_cartone"] = df["referenza"].apply(rileva_pezzi_cartone)
+            df["prezzo_unitario_pz"] = df.apply(lambda r: prezzo_singolo_da_cartone(r.get("prezzo_unitario", 0), r.get("pezzi_per_cartone", 0)), axis=1)
+            colonne = ["importa", "prodotto_interno", "referenza", "tipo", "categoria", "unita", "fornitore", "codice_fornitore", "prezzo_unitario", "pezzi_per_cartone", "prezzo_unitario_pz", "ultima_quantita", "ultimo_importo", "iva", "scorta_minima", "attivo", "nome_file"]
             df = df[[c for c in colonne if c in df.columns]]
             st.success(f"Righe prodotto trovate: {len(df)}")
             df_edit = st.data_editor(
@@ -706,6 +777,8 @@ elif menu == "Import fatture":
                     "tipo": st.column_config.SelectboxColumn("tipo", options=TIPI),
                     "categoria": st.column_config.SelectboxColumn("categoria", options=CATEGORIE),
                     "unita": st.column_config.SelectboxColumn("unita", options=UNITA),
+                    "pezzi_per_cartone": st.column_config.NumberColumn("pezzi per cartone", min_value=0.0, step=1.0, help="Se il prezzo è del cartone/confezione, indica quanti pezzi contiene. Se l’app lo capisce dalla descrizione lo precompila."),
+                    "prezzo_unitario_pz": st.column_config.NumberColumn("prezzo singolo pz", min_value=0.0, step=0.001),
                 }, key="fatture_accorpate_editor")
             if st.button("Salva fatture e aggiorna prezzi medi"):
                 referenze = fetch_table("referenze")
@@ -729,8 +802,12 @@ elif menu == "Import fatture":
                                 "unita": row.get("unita", "pz"),
                                 "fornitore": "MULTI" if row.get("fornitore", "") else "",
                                 "codice_fornitore": "", "prezzo_unitario": pulisci_numero(row.get("prezzo_unitario", 0)),
+                                "pezzi_per_cartone": pulisci_numero(row.get("pezzi_per_cartone", 0)),
+                                "prezzo_unitario_pz": pulisci_numero(row.get("prezzo_unitario_pz", 0)) or prezzo_singolo_da_cartone(row.get("prezzo_unitario", 0), row.get("pezzi_per_cartone", 0)),
                                 "ultima_quantita": pulisci_numero(row.get("ultima_quantita", 0)),
                                 "ultimo_importo": pulisci_numero(row.get("ultimo_importo", 0)),
+                                "pezzi_per_cartone": pulisci_numero(row.get("pezzi_per_cartone", hit.iloc[0].get("pezzi_per_cartone", 0))),
+                                "prezzo_unitario_pz": pulisci_numero(row.get("prezzo_unitario_pz", 0)) or prezzo_singolo_da_cartone(row.get("prezzo_unitario", 0), row.get("pezzi_per_cartone", hit.iloc[0].get("pezzi_per_cartone", 0))),
                                 "iva": str(row.get("iva", "")).strip(), "scorta_minima": pulisci_numero(row.get("scorta_minima", 0)),
                                 "attivo": "si",
                             }
@@ -754,7 +831,7 @@ elif menu == "Import fatture":
                                 "attivo": str(row.get("attivo", "si")),
                             }); aggiornate += 1
                         upsert_alias(codice_interno, row.get("fornitore", ""), row.get("codice_fornitore", ""), nome_fattura, row.get("unita", "pz"), row.get("prezzo_unitario", 0))
-                        registra_acquisto(data_fattura, row.get("fornitore", ""), codice_interno, referenza_interna, nome_fattura, row.get("codice_fornitore", ""), row.get("ultima_quantita", 0), row.get("unita", "pz"), row.get("prezzo_unitario", 0), row.get("ultimo_importo", 0), row.get("iva", ""), row.get("nome_file", ""))
+                        registra_acquisto(data_fattura, row.get("fornitore", ""), codice_interno, referenza_interna, nome_fattura, row.get("codice_fornitore", ""), row.get("ultima_quantita", 0), row.get("unita", "pz"), row.get("prezzo_unitario", 0), row.get("ultimo_importo", 0), row.get("iva", ""), row.get("nome_file", ""), row.get("pezzi_per_cartone", 0), row.get("prezzo_unitario_pz", 0) or prezzo_singolo_da_cartone(row.get("prezzo_unitario", 0), row.get("pezzi_per_cartone", 0)))
                         acquisti += 1
                         aggiorna_prezzo_medio_mese(codice_interno, data_fattura.month, data_fattura.year)
                     except Exception as e:
@@ -784,6 +861,10 @@ elif menu == "Anagrafica referenze":
             categoria = st.selectbox("Categoria", CATEGORIE)
             unita = st.selectbox("Unità", UNITA)
             prezzo = st.number_input("Prezzo unitario iniziale", min_value=0.0, step=0.01)
+            pezzi_per_cartone = st.number_input("Pezzi per cartone/confezione", min_value=0.0, step=1.0)
+            prezzo_unitario_pz = prezzo_singolo_da_cartone(prezzo, pezzi_per_cartone)
+            if prezzo_unitario_pz:
+                st.caption(f"Prezzo singolo pezzo calcolato: € {prezzo_unitario_pz:.3f}")
             scorta_minima = st.number_input("Scorta minima", min_value=0.0, step=0.1)
             salva = st.form_submit_button("Aggiungi prodotto")
             if salva:
@@ -792,7 +873,7 @@ elif menu == "Anagrafica referenze":
                     st.error("Inserisci un prodotto.")
                 else:
                     codice = genera_codice(nome, referenze)
-                    insert_rows("referenze", [{"codice": codice, "referenza": nome, "tipo": tipo, "categoria": categoria, "unita": unita, "fornitore": "MULTI", "codice_fornitore": "", "prezzo_unitario": prezzo, "ultima_quantita": 0.0, "ultimo_importo": 0.0, "iva": "", "scorta_minima": scorta_minima, "attivo": "si"}])
+                    insert_rows("referenze", [{"codice": codice, "referenza": nome, "tipo": tipo, "categoria": categoria, "unita": unita, "fornitore": "MULTI", "codice_fornitore": "", "prezzo_unitario": prezzo, "pezzi_per_cartone": pezzi_per_cartone, "prezzo_unitario_pz": prezzo_unitario_pz, "ultima_quantita": 0.0, "ultimo_importo": 0.0, "iva": "", "scorta_minima": scorta_minima, "attivo": "si"}])
                     st.success("Prodotto interno aggiunto.")
                     st.rerun()
 
@@ -810,7 +891,7 @@ elif menu == "Anagrafica referenze":
                 for _, row in edited.iterrows():
                     if "id" not in row or pd.isna(row["id"]):
                         continue
-                    update_row("referenze", row["id"], {"codice": str(row.get("codice", "")), "referenza": str(row.get("referenza", "")), "tipo": str(row.get("tipo", "Food")), "categoria": str(row.get("categoria", "Altro")), "unita": str(row.get("unita", "pz")), "fornitore": str(row.get("fornitore", "MULTI")), "codice_fornitore": str(row.get("codice_fornitore", "")), "prezzo_unitario": pulisci_numero(row.get("prezzo_unitario", 0)), "ultima_quantita": pulisci_numero(row.get("ultima_quantita", 0)), "ultimo_importo": pulisci_numero(row.get("ultimo_importo", 0)), "iva": str(row.get("iva", "")), "scorta_minima": pulisci_numero(row.get("scorta_minima", 0)), "attivo": str(row.get("attivo", "si"))})
+                    update_row("referenze", row["id"], {"codice": str(row.get("codice", "")), "referenza": str(row.get("referenza", "")), "tipo": str(row.get("tipo", "Food")), "categoria": str(row.get("categoria", "Altro")), "unita": str(row.get("unita", "pz")), "fornitore": str(row.get("fornitore", "MULTI")), "codice_fornitore": str(row.get("codice_fornitore", "")), "prezzo_unitario": pulisci_numero(row.get("prezzo_unitario", 0)), "pezzi_per_cartone": pulisci_numero(row.get("pezzi_per_cartone", 0)), "prezzo_unitario_pz": pulisci_numero(row.get("prezzo_unitario_pz", 0)) or prezzo_singolo_da_cartone(row.get("prezzo_unitario", 0), row.get("pezzi_per_cartone", 0)), "ultima_quantita": pulisci_numero(row.get("ultima_quantita", 0)), "ultimo_importo": pulisci_numero(row.get("ultimo_importo", 0)), "iva": str(row.get("iva", "")), "scorta_minima": pulisci_numero(row.get("scorta_minima", 0)), "attivo": str(row.get("attivo", "si"))})
                 st.success("Anagrafica salvata.")
 
     with tab3:
@@ -849,8 +930,12 @@ elif menu == "Anagrafica referenze":
                 work,
                 use_container_width=True,
                 hide_index=True,
-                disabled=["id", "fornitore", "codice_fornitore", "descrizione_fornitore", "unita", "ultimo_prezzo"],
-                column_config={"prodotto_interno": st.column_config.SelectboxColumn("prodotto interno corretto", options=options)},
+                disabled=["id", "fornitore", "codice_fornitore", "descrizione_fornitore"],
+                column_config={
+                    "unita": st.column_config.SelectboxColumn("unità", options=UNITA),
+                    "ultimo_prezzo": st.column_config.NumberColumn("ultimo prezzo", min_value=0.0, step=0.001),
+                    "prodotto_interno": st.column_config.SelectboxColumn("prodotto interno corretto", options=options),
+                },
                 key="associa_alias_editor",
             )
             if st.button("Salva associazioni manuali"):
@@ -861,13 +946,19 @@ elif menu == "Anagrafica referenze":
                     try:
                         aid = row.get("id")
                         nuovo_label = str(row.get("prodotto_interno", ""))
-                        if not aid or not nuovo_label or nuovo_label == str(originale.get(aid, "")):
+                        if not aid:
                             continue
-                        nuovo_codice = label_to_codice.get(nuovo_label, "")
-                        nuova_ref = codice_to_nome.get(nuovo_codice, "")
-                        if nuovo_codice:
+                        vecchio_label = str(originale.get(aid, ""))
+                        nuovo_codice = label_to_codice.get(nuovo_label, "") if nuovo_label else ""
+                        nuova_ref = codice_to_nome.get(nuovo_codice, "") if nuovo_codice else ""
+                        payload_alias = {
+                            "unita": str(row.get("unita", "pz")),
+                            "ultimo_prezzo": pulisci_numero(row.get("ultimo_prezzo", 0)),
+                        }
+                        update_row("fornitori_referenze", aid, payload_alias)
+                        if nuovo_codice and nuovo_label != vecchio_label:
                             aggiorna_alias_e_acquisti(aid, nuovo_codice, nuova_ref)
-                            modifiche += 1
+                        modifiche += 1
                     except Exception as e:
                         errori.append(str(e))
                 if errori:
@@ -948,19 +1039,21 @@ elif menu == "Inventario mensile":
         for tab, store in zip(store_tabs, stores_visibili()):
             with tab:
                 st.markdown(f"### {store}")
-                base = attive[["codice", "referenza", "tipo", "categoria", "unita"]].copy()
-                base.insert(0, "punto_vendita", store); base["quantita"] = 0.0; base["note"] = ""
+                base = attive[["codice", "referenza", "tipo", "categoria", "unita", "prezzo_unitario"]].copy()
+                base.insert(0, "punto_vendita", store); base["quantita"] = 0.0; base["importo"] = 0.0; base["note"] = ""
                 esistente = inventari[(inventari["data_inventario"].astype(str) == data_str) & (inventari["punto_vendita"].astype(str) == store)].copy() if not inventari.empty else pd.DataFrame()
                 if not esistente.empty:
                     # Mantiene anche l'unità di misura salvata nell'inventario, perché a volte
                     # si acquista a cartoni/confezioni ma si conta o trasferisce a pezzi.
-                    cols_esistente = [c for c in ["codice", "quantita", "note", "unita"] if c in esistente.columns]
+                    cols_esistente = [c for c in ["codice", "quantita", "note", "unita", "prezzo_unitario", "importo"] if c in esistente.columns]
                     esistente_small = esistente[cols_esistente].copy()
                     if "unita" in esistente_small.columns:
                         esistente_small = esistente_small.rename(columns={"unita": "unita_salvata"})
-                    base = base.drop(columns=["quantita", "note"]).merge(esistente_small, on="codice", how="left")
+                    base = base.drop(columns=["quantita", "note", "prezzo_unitario", "importo"], errors="ignore").merge(esistente_small, on="codice", how="left")
                     base["quantita"] = pd.to_numeric(base["quantita"], errors="coerce").fillna(0)
                     base["note"] = base["note"].fillna("") if "note" in base.columns else ""
+                    base["prezzo_unitario"] = pd.to_numeric(base.get("prezzo_unitario", 0), errors="coerce").fillna(0)
+                    base["importo"] = pd.to_numeric(base.get("importo", 0), errors="coerce").fillna(0)
                     if "unita_salvata" in base.columns:
                         base["unita"] = base["unita_salvata"].fillna(base["unita"])
                         base = base.drop(columns=["unita_salvata"], errors="ignore")
@@ -977,6 +1070,8 @@ elif menu == "Inventario mensile":
                     column_config={
                         "unita": st.column_config.SelectboxColumn("Unità", options=UNITA),
                         "quantita": st.column_config.NumberColumn("Quantità", min_value=0.0, step=0.1),
+                        "prezzo_unitario": st.column_config.NumberColumn("Prezzo unitario", min_value=0.0, step=0.001),
+                        "importo": st.column_config.NumberColumn("Importo", min_value=0.0, step=0.01),
                     },
                     key=f"inventario_{data_str}_{store}",
                 )
@@ -985,7 +1080,7 @@ elif menu == "Inventario mensile":
             edited_all = pd.concat(edited_tables, ignore_index=True) if edited_tables else pd.DataFrame()
             rows = []
             for _, row in edited_all.iterrows():
-                rows.append({"data_inventario": data_str, "mese": mese, "anno": anno, "punto_vendita": str(row["punto_vendita"]), "codice": str(row["codice"]), "referenza": str(row["referenza"]), "tipo": str(row["tipo"]), "categoria": str(row["categoria"]), "unita": str(row["unita"]), "quantita": pulisci_numero(row.get("quantita", 0)), "note": str(row.get("note", ""))})
+                rows.append({"data_inventario": data_str, "mese": mese, "anno": anno, "punto_vendita": str(row["punto_vendita"]), "codice": str(row["codice"]), "referenza": str(row["referenza"]), "tipo": str(row["tipo"]), "categoria": str(row["categoria"]), "unita": str(row["unita"]), "quantita": pulisci_numero(row.get("quantita", 0)), "prezzo_unitario": pulisci_numero(row.get("prezzo_unitario", 0)), "importo": pulisci_numero(row.get("importo", 0)) or (pulisci_numero(row.get("quantita", 0)) * pulisci_numero(row.get("prezzo_unitario", 0))), "note": str(row.get("note", ""))})
             if rows:
                 for store in stores_visibili():
                     delete_inventory(data_str, store)
@@ -1000,7 +1095,9 @@ elif menu == "Inventario mensile":
             for _, k in chiavi.iterrows():
                 with st.expander(f"{k['data_inventario']} - {k['punto_vendita']}"):
                     df_inv = inventari[(inventari["data_inventario"].astype(str) == str(k["data_inventario"])) & (inventari["punto_vendita"].astype(str) == str(k["punto_vendita"]))]
-                    st.dataframe(df_inv.sort_values(["tipo", "categoria", "referenza"]), use_container_width=True)
+                    df_inv_export = aggiungi_prezzi_referenze(df_inv.sort_values(["tipo", "categoria", "referenza"]), fetch_table("referenze"))
+                    st.dataframe(df_inv_export, use_container_width=True)
+                    st.download_button("Scarica inventario Excel", excel_bytes({"Inventario": df_inv_export}), f"tup_inventario_{k['data_inventario']}_{k['punto_vendita']}.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"dl_inv_{k['data_inventario']}_{k['punto_vendita']}")
 
 # =========================
 # TRASFERIMENTI
@@ -1032,17 +1129,64 @@ elif menu == "Trasferimenti merci":
             unita_default = str(riga.get("unita", "pz"))
             unita_index = UNITA.index(unita_default) if unita_default in UNITA else 0
             unita_trasferimento = st.selectbox("Unità trasferimento", UNITA, index=unita_index)
+            prezzo_cartone = pulisci_numero(riga.get("prezzo_unitario", 0))
+            pezzi_cartone = pulisci_numero(riga.get("pezzi_per_cartone", 0)) if "pezzi_per_cartone" in riga.index else 0
+            prezzo_pz = pulisci_numero(riga.get("prezzo_unitario_pz", 0)) if "prezzo_unitario_pz" in riga.index else 0
+            prezzo_default = prezzo_pz if unita_trasferimento in ["pz", "NR"] and prezzo_pz > 0 else prezzo_cartone
+            prezzo_trasferimento = st.number_input("Prezzo unitario trasferimento", min_value=0.0, step=0.001, value=float(prezzo_default))
             quantita = st.number_input("Quantità", min_value=0.0, step=0.1)
             note = st.text_input("Note")
             salva = st.form_submit_button("Salva trasferimento")
             if salva:
                 if quantita <= 0: st.error("Inserisci una quantità maggiore di zero.")
                 else:
-                    insert_rows("trasferimenti", [{"data_trasferimento": data_trasferimento.strftime("%Y-%m-%d"), "da_punto_vendita": da_store, "a_punto_vendita": a_store, "codice": str(riga["codice"]), "referenza": str(riga["referenza"]), "tipo": str(riga["tipo"]), "categoria": str(riga["categoria"]), "unita": str(unita_trasferimento), "quantita": quantita, "note": note}])
+                    insert_rows("trasferimenti", [{"data_trasferimento": data_trasferimento.strftime("%Y-%m-%d"), "da_punto_vendita": da_store, "a_punto_vendita": a_store, "codice": str(riga["codice"]), "referenza": str(riga["referenza"]), "tipo": str(riga["tipo"]), "categoria": str(riga["categoria"]), "unita": str(unita_trasferimento), "quantita": quantita, "prezzo_unitario": prezzo_trasferimento, "importo": quantita * prezzo_trasferimento, "note": note}])
                     st.success("Trasferimento salvato.")
         trasferimenti = fetch_table("trasferimenti")
         if not trasferimenti.empty:
-            st.dataframe(trasferimenti.sort_values("data_trasferimento", ascending=False), use_container_width=True)
+            trasferimenti["data_trasferimento"] = pd.to_datetime(trasferimenti["data_trasferimento"], errors="coerce")
+            trasferimenti["mese"] = trasferimenti["data_trasferimento"].dt.month
+            trasferimenti["anno"] = trasferimenti["data_trasferimento"].dt.year
+            anni_tr = sorted(trasferimenti["anno"].dropna().astype(int).unique().tolist(), reverse=True)
+            colm1, colm2 = st.columns(2)
+            with colm1:
+                anno_tr = st.selectbox("Anno scheda trasferimenti", anni_tr, index=0)
+            with colm2:
+                mese_tr = st.selectbox("Mese scheda trasferimenti", list(range(1, 13)), index=date.today().month - 1)
+            mese_df = trasferimenti[(trasferimenti["anno"] == anno_tr) & (trasferimenti["mese"] == mese_tr)].copy()
+            referenze_now = fetch_table("referenze")
+            mese_df = aggiungi_prezzi_referenze(mese_df.drop(columns=["prezzo_unitario_y", "prezzo_unitario_x"], errors="ignore"), referenze_now) if not mese_df.empty else mese_df
+            st.markdown(f"### Scheda trasferimenti {mese_tr:02d}/{anno_tr}")
+            mese_view = mese_df.sort_values("data_trasferimento", ascending=False).copy()
+            edited_tr = st.data_editor(
+                mese_view,
+                use_container_width=True,
+                hide_index=True,
+                disabled=[c for c in mese_view.columns if c not in ["unita", "prezzo_unitario", "quantita", "importo", "note"]],
+                column_config={
+                    "unita": st.column_config.SelectboxColumn("Unità", options=UNITA),
+                    "prezzo_unitario": st.column_config.NumberColumn("Prezzo unitario", min_value=0.0, step=0.001),
+                    "quantita": st.column_config.NumberColumn("Quantità", min_value=0.0, step=0.1),
+                    "importo": st.column_config.NumberColumn("Importo", min_value=0.0, step=0.01),
+                },
+                key=f"trasferimenti_mese_editor_{anno_tr}_{mese_tr}",
+            )
+            if st.button("Salva modifiche scheda trasferimenti", key=f"save_tr_{anno_tr}_{mese_tr}"):
+                salvati = 0
+                for _, rr in edited_tr.iterrows():
+                    if "id" in rr and not pd.isna(rr.get("id")):
+                        q = pulisci_numero(rr.get("quantita", 0)); pr = pulisci_numero(rr.get("prezzo_unitario", 0))
+                        imp = pulisci_numero(rr.get("importo", 0)) or q * pr
+                        update_row("trasferimenti", rr["id"], {"unita": str(rr.get("unita", "pz")), "quantita": q, "prezzo_unitario": pr, "importo": imp, "note": str(rr.get("note", ""))})
+                        salvati += 1
+                st.success(f"Scheda trasferimenti aggiornata: {salvati} righe")
+                st.rerun()
+            st.download_button(
+                "Scarica scheda trasferimenti mensile Excel",
+                excel_bytes({f"Trasferimenti {mese_tr:02d}-{anno_tr}": edited_tr}),
+                f"tup_trasferimenti_{anno_tr}_{mese_tr:02d}.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 # =========================
 # ACQUISTI E PREZZI MEDI
@@ -1077,13 +1221,17 @@ elif menu == "Acquisti e prezzi medi":
 
 elif menu == "Export":
     st.subheader("Export")
-    referenze = fetch_table("referenze"); inventari = dedup_inventari_latest(fetch_table("inventari")); alias = fetch_table("fornitori_referenze"); acquisti = fetch_table("acquisti_fatture")
+    referenze = fetch_table("referenze"); inventari = dedup_inventari_latest(fetch_table("inventari")); alias = fetch_table("fornitori_referenze"); acquisti = fetch_table("acquisti_fatture"); trasferimenti = fetch_table("trasferimenti")
     col1, col2 = st.columns(2)
     with col1:
         st.download_button("Scarica prodotti interni CSV", referenze.to_csv(index=False).encode("utf-8"), "tup_prodotti_interni.csv", "text/csv")
         st.download_button("Scarica alias fornitori CSV", alias.to_csv(index=False).encode("utf-8"), "tup_alias_fornitori.csv", "text/csv")
     with col2:
-        st.download_button("Scarica inventari CSV", inventari.to_csv(index=False).encode("utf-8"), "tup_inventari.csv", "text/csv")
+        inv_xlsx = aggiungi_prezzi_referenze(inventari, referenze)
+        tr_xlsx = aggiungi_prezzi_referenze(trasferimenti, referenze)
+        st.download_button("Scarica inventari Excel", excel_bytes({"Inventari": inv_xlsx}), "tup_inventari.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        st.download_button("Scarica trasferimenti Excel", excel_bytes({"Trasferimenti": tr_xlsx}), "tup_trasferimenti.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Scarica acquisti fatture CSV", acquisti.to_csv(index=False).encode("utf-8"), "tup_acquisti_fatture.csv", "text/csv")
+
 
 
