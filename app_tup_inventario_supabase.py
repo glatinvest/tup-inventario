@@ -4,6 +4,8 @@ from datetime import date
 import re
 import tempfile
 import io
+import zipfile
+from html import escape
 import xml.etree.ElementTree as ET
 
 try:
@@ -158,36 +160,85 @@ def prepara_df_excel(df):
     return out
 
 
+def _xlsx_col(n):
+    s = ""
+    while n:
+        n, r = divmod(n - 1, 26)
+        s = chr(65 + r) + s
+    return s
+
+
+def _cell_xml(row, col, value):
+    ref = f"{_xlsx_col(col)}{row}"
+    if pd.isna(value):
+        return f'<c r="{ref}"/>'
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f'<c r="{ref}"><v>{value}</v></c>'
+    txt = escape(str(value))
+    return f'<c r="{ref}" t="inlineStr"><is><t>{txt}</t></is></c>'
+
+
+def _sheet_xml(df):
+    df = prepara_df_excel(df)
+    rows = []
+    cols = list(df.columns)
+    rows.append('<row r="1">' + ''.join(_cell_xml(1, i + 1, c) for i, c in enumerate(cols)) + '</row>')
+    for r_idx, (_, row) in enumerate(df.iterrows(), start=2):
+        rows.append(f'<row r="{r_idx}">' + ''.join(_cell_xml(r_idx, c_idx + 1, row.get(c, "")) for c_idx, c in enumerate(cols)) + '</row>')
+    return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>' + ''.join(rows) + '</sheetData></worksheet>'
+
+
 def excel_bytes(sheets):
+    # Writer XLSX minimale senza dipendenze esterne: evita errori se openpyxl non è installato su Streamlit Cloud.
     bio = io.BytesIO()
-    try:
-        with pd.ExcelWriter(bio, engine="openpyxl") as writer:
-            for name, df in sheets.items():
-                prepara_df_excel(df).to_excel(writer, sheet_name=str(name)[:31], index=False)
-        return bio.getvalue()
-    except Exception:
-        bio = io.BytesIO()
-        with pd.ExcelWriter(bio) as writer:
-            for name, df in sheets.items():
-                prepara_df_excel(df).to_excel(writer, sheet_name=str(name)[:31], index=False)
-        return bio.getvalue()
+    sheet_items = list(sheets.items()) or [("Foglio1", pd.DataFrame())]
+    with zipfile.ZipFile(bio, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("[Content_Types].xml", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>' + ''.join([f'<Override PartName="/xl/worksheets/sheet{i}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>' for i in range(1, len(sheet_items)+1)]) + '</Types>')
+        z.writestr("_rels/.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        z.writestr("xl/_rels/workbook.xml.rels", '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' + ''.join([f'<Relationship Id="rId{i}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet{i}.xml"/>' for i in range(1, len(sheet_items)+1)]) + '</Relationships>')
+        sheets_xml = ''.join([f'<sheet name="{escape(str(name)[:31])}" sheetId="{i}" r:id="rId{i}"/>' for i, (name, _) in enumerate(sheet_items, start=1)])
+        z.writestr("xl/workbook.xml", f'<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets>{sheets_xml}</sheets></workbook>')
+        for i, (_, df) in enumerate(sheet_items, start=1):
+            z.writestr(f"xl/worksheets/sheet{i}.xml", _sheet_xml(df))
+    return bio.getvalue()
 
 
 def aggiungi_prezzi_referenze(df, referenze):
     out = df.copy()
-    if out.empty or referenze.empty:
+    if out.empty:
         return out
-    ref = referenze.copy()
-    for c in ["prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]:
-        if c not in ref.columns:
-            ref[c] = 0
-    cols = ["codice", "prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]
-    out = out.merge(ref[cols].drop_duplicates("codice", keep="last"), on="codice", how="left")
-    for c in ["quantita", "prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]:
+
+    # Pulizia colonne nate da merge precedenti (_x/_y) e preservazione del prezzo manuale salvato.
+    prezzo_riga = pd.Series(0, index=out.index, dtype="float64")
+    for c in ["prezzo_unitario", "prezzo_unitario_x", "prezzo_unitario_y"]:
+        if c in out.columns:
+            vals = pd.to_numeric(out[c], errors="coerce").fillna(0)
+            prezzo_riga = prezzo_riga.where(prezzo_riga > 0, vals)
+    out = out.drop(columns=["prezzo_unitario_x", "prezzo_unitario_y", "prezzo_unitario_pz", "pezzi_per_cartone", "prezzo_applicato", "valore"], errors="ignore")
+    out["prezzo_unitario"] = prezzo_riga
+
+    if referenze is not None and not referenze.empty and "codice" in out.columns:
+        ref = referenze.copy()
+        for c in ["prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]:
+            if c not in ref.columns:
+                ref[c] = 0
+        ref = ref[["codice", "prezzo_unitario", "prezzo_unitario_pz", "pezzi_per_cartone"]].drop_duplicates("codice", keep="last")
+        ref = ref.rename(columns={"prezzo_unitario": "prezzo_unitario_anagrafica"})
+        out = out.merge(ref, on="codice", how="left")
+    else:
+        out["prezzo_unitario_anagrafica"] = 0
+        out["prezzo_unitario_pz"] = 0
+        out["pezzi_per_cartone"] = 0
+
+    for c in ["quantita", "prezzo_unitario", "prezzo_unitario_anagrafica", "prezzo_unitario_pz", "pezzi_per_cartone"]:
         if c in out.columns:
             out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0)
-    out["prezzo_applicato"] = out.apply(lambda r: r.get("prezzo_unitario_pz",0) if str(r.get("unita","")).lower() in ["pz", "nr"] and r.get("prezzo_unitario_pz",0)>0 else r.get("prezzo_unitario",0), axis=1)
-    out["valore"] = out["quantita"] * out["prezzo_applicato"]
+
+    # Se il prezzo manuale della riga è zero, propongo quello dell'anagrafica.
+    out["prezzo_unitario"] = out["prezzo_unitario"].where(out["prezzo_unitario"] > 0, out["prezzo_unitario_anagrafica"])
+    out["prezzo_applicato"] = out.apply(lambda r: r.get("prezzo_unitario_pz", 0) if str(r.get("unita", "")).lower() in ["pz", "nr"] and r.get("prezzo_unitario_pz", 0) > 0 else r.get("prezzo_unitario", 0), axis=1)
+    out["valore"] = pd.to_numeric(out.get("quantita", 0), errors="coerce").fillna(0) * pd.to_numeric(out.get("prezzo_unitario", 0), errors="coerce").fillna(0)
+    out = out.drop(columns=["prezzo_unitario_anagrafica"], errors="ignore")
     return out
 
 def genera_codice(nome, df):
@@ -1260,6 +1311,7 @@ elif menu == "Export":
         st.download_button("Scarica inventari Excel", excel_bytes({"Inventari": inv_xlsx}), "tup_inventari.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Scarica trasferimenti Excel", excel_bytes({"Trasferimenti": tr_xlsx}), "tup_trasferimenti.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Scarica acquisti fatture CSV", acquisti.to_csv(index=False).encode("utf-8"), "tup_acquisti_fatture.csv", "text/csv")
+
 
 
 
