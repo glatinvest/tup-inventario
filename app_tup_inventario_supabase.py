@@ -691,7 +691,23 @@ if menu == "Dashboard":
                 st.info(f"Nessun inventario salvato per {store}.")
                 continue
             ultimo["quantita"] = pd.to_numeric(ultimo["quantita"], errors="coerce").fillna(0)
-            valorizzato = ultimo.merge(ref[["codice", "prezzo_unitario", "scorta_minima"]], on="codice", how="left")
+            valorizzato = ultimo.merge(
+                ref[["codice", "prezzo_unitario", "scorta_minima"]],
+                on="codice",
+                how="left",
+                suffixes=("", "_anagrafica")
+            )
+
+            # Compatibilità: se gli inventari hanno già una colonna prezzo_unitario
+            # uso quella; se è vuota, uso il prezzo dell'anagrafica.
+            if "prezzo_unitario" not in valorizzato.columns:
+                valorizzato["prezzo_unitario"] = 0
+            if "prezzo_unitario_anagrafica" in valorizzato.columns:
+                prezzo_inv = pd.to_numeric(valorizzato["prezzo_unitario"], errors="coerce")
+                prezzo_ana = pd.to_numeric(valorizzato["prezzo_unitario_anagrafica"], errors="coerce")
+                valorizzato["prezzo_unitario"] = prezzo_inv.fillna(0)
+                valorizzato.loc[valorizzato["prezzo_unitario"] == 0, "prezzo_unitario"] = prezzo_ana.fillna(0)
+
             valorizzato["prezzo_unitario"] = pd.to_numeric(valorizzato["prezzo_unitario"], errors="coerce").fillna(0)
             valorizzato["scorta_minima"] = pd.to_numeric(valorizzato["scorta_minima"], errors="coerce").fillna(0)
             valorizzato["valore"] = valorizzato["quantita"] * valorizzato["prezzo_unitario"]
@@ -1232,6 +1248,7 @@ elif menu == "Export":
         st.download_button("Scarica inventari Excel", excel_bytes({"Inventari": inv_xlsx}), "tup_inventari.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Scarica trasferimenti Excel", excel_bytes({"Trasferimenti": tr_xlsx}), "tup_trasferimenti.xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.download_button("Scarica acquisti fatture CSV", acquisti.to_csv(index=False).encode("utf-8"), "tup_acquisti_fatture.csv", "text/csv")
+
 
 
 
