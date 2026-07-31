@@ -82,6 +82,33 @@ def delete_inventory(data_inventario, punto_vendita):
     sb().table("inventari").delete().eq("data_inventario", data_inventario).eq("punto_vendita", punto_vendita).execute()
 
 
+def fetch_inventory_draft(data_inventario, punto_vendita):
+    try:
+        res = (sb().table("inventari_bozze").select("*")
+               .eq("data_inventario", data_inventario)
+               .eq("punto_vendita", punto_vendita).execute())
+        return pd.DataFrame(res.data)
+    except Exception:
+        return pd.DataFrame()
+
+
+def save_inventory_draft(rows):
+    if not rows:
+        return
+    sb().table("inventari_bozze").upsert(
+        rows, on_conflict="data_inventario,punto_vendita,codice"
+    ).execute()
+
+
+def delete_inventory_draft(data_inventario, punto_vendita):
+    try:
+        (sb().table("inventari_bozze").delete()
+         .eq("data_inventario", data_inventario)
+         .eq("punto_vendita", punto_vendita).execute())
+    except Exception:
+        pass
+
+
 def delete_references_by_ids(ids):
     if not ids:
         return
@@ -715,7 +742,13 @@ with st.sidebar:
         st.session_state["loggato"] = False
         st.session_state["ruolo"] = None
         st.rerun()
-    menu = st.radio("Menu", ["Dashboard", "Import fatture", "Anagrafica referenze", "Inventario mensile", "Trasferimenti merci", "Acquisti e prezzi medi", "Export"])
+    MENU_OPTIONS = ["Dashboard", "Import fatture", "Anagrafica referenze", "Inventario mensile", "Trasferimenti merci", "Acquisti e prezzi medi", "Export"]
+    pagina_url = st.query_params.get("pagina", "Dashboard")
+    if pagina_url not in MENU_OPTIONS:
+        pagina_url = "Dashboard"
+    menu = st.radio("Menu", MENU_OPTIONS, index=MENU_OPTIONS.index(pagina_url), key="menu_principale")
+    if st.query_params.get("pagina") != menu:
+        st.query_params["pagina"] = menu
 
 # =========================
 # DASHBOARD
@@ -1110,32 +1143,38 @@ elif menu == "Inventario mensile":
         data_inventario = st.date_input("Data inventario", value=date.today())
         data_str = data_inventario.strftime("%Y-%m-%d"); mese = data_inventario.month; anno = data_inventario.year
         st.caption(f"Inventario del mese: {mese:02d}/{anno}")
-        st.info("Quando salvi, l’inventario di quel giorno e punto vendita viene sostituito, non duplicato.")
+        st.info("Le modifiche vengono salvate automaticamente come bozza. Se il telefono ricarica la pagina, ritrovi i dati inseriti.")
         attive = referenze[referenze["attivo"].astype(str).str.lower() != "no"].copy().sort_values(["tipo", "categoria", "referenza"])
         attive = attive.drop_duplicates(subset=["codice"], keep="last")
         store_tabs = st.tabs(stores_visibili())
         edited_tables = []
+        draft_status = []
         for tab, store in zip(store_tabs, stores_visibili()):
             with tab:
                 st.markdown(f"### {store}")
                 base = attive[["codice", "referenza", "tipo", "categoria", "unita", "prezzo_unitario"]].copy()
                 base.insert(0, "punto_vendita", store); base["quantita"] = 0.0; base["importo"] = 0.0; base["note"] = ""
+
+                # Priorità: bozza automatica > inventario definitivo già salvato > valori anagrafica.
+                bozza = fetch_inventory_draft(data_str, store)
                 esistente = inventari[(inventari["data_inventario"].astype(str) == data_str) & (inventari["punto_vendita"].astype(str) == store)].copy() if not inventari.empty else pd.DataFrame()
-                if not esistente.empty:
-                    # Mantiene anche l'unità di misura salvata nell'inventario, perché a volte
-                    # si acquista a cartoni/confezioni ma si conta o trasferisce a pezzi.
-                    cols_esistente = [c for c in ["codice", "quantita", "note", "unita", "prezzo_unitario", "importo"] if c in esistente.columns]
-                    esistente_small = esistente[cols_esistente].copy()
-                    if "unita" in esistente_small.columns:
-                        esistente_small = esistente_small.rename(columns={"unita": "unita_salvata"})
-                    base = base.drop(columns=["quantita", "note", "prezzo_unitario", "importo"], errors="ignore").merge(esistente_small, on="codice", how="left")
-                    base["quantita"] = pd.to_numeric(base["quantita"], errors="coerce").fillna(0)
-                    base["note"] = base["note"].fillna("") if "note" in base.columns else ""
+                sorgente = bozza if not bozza.empty else esistente
+                if not bozza.empty:
+                    st.caption("✅ Bozza automatica ripristinata")
+                if not sorgente.empty:
+                    cols = [c for c in ["codice", "quantita", "note", "unita", "prezzo_unitario", "importo"] if c in sorgente.columns]
+                    small = sorgente[cols].copy().drop_duplicates("codice", keep="last")
+                    if "unita" in small.columns:
+                        small = small.rename(columns={"unita": "unita_salvata"})
+                    base = base.drop(columns=["quantita", "note", "prezzo_unitario", "importo"], errors="ignore").merge(small, on="codice", how="left")
+                    base["quantita"] = pd.to_numeric(base.get("quantita", 0), errors="coerce").fillna(0)
+                    base["note"] = base.get("note", "").fillna("")
                     base["prezzo_unitario"] = pd.to_numeric(base.get("prezzo_unitario", 0), errors="coerce").fillna(0)
                     base["importo"] = pd.to_numeric(base.get("importo", 0), errors="coerce").fillna(0)
                     if "unita_salvata" in base.columns:
                         base["unita"] = base["unita_salvata"].fillna(base["unita"])
                         base = base.drop(columns=["unita_salvata"], errors="ignore")
+
                 filtro_tipo = st.selectbox("Tipo", ["Tutti"] + TIPI, key=f"tipo_inv_{store}")
                 filtro_categoria = st.multiselect("Categoria", sorted(attive["categoria"].dropna().unique().tolist()), key=f"cat_inv_{store}")
                 tabella = base.copy()
@@ -1155,16 +1194,58 @@ elif menu == "Inventario mensile":
                     key=f"inventario_{data_str}_{store}",
                 )
                 edited_tables.append(edited)
-        if st.button("Salva inventario mensile"):
+
+                # Autosalvataggio persistente: eseguito a ogni modifica del data editor.
+                draft_rows = []
+                for _, row in edited.iterrows():
+                    q = pulisci_numero(row.get("quantita", 0))
+                    p = pulisci_numero(row.get("prezzo_unitario", 0))
+                    imp = pulisci_numero(row.get("importo", 0)) or (q * p)
+                    draft_rows.append({
+                        "data_inventario": data_str, "mese": mese, "anno": anno,
+                        "punto_vendita": store, "codice": str(row.get("codice", "")),
+                        "referenza": str(row.get("referenza", "")), "tipo": str(row.get("tipo", "Food")),
+                        "categoria": str(row.get("categoria", "Altro")), "unita": str(row.get("unita", "pz")),
+                        "quantita": q, "prezzo_unitario": p, "importo": imp,
+                        "note": str(row.get("note", "")), "updated_at": pd.Timestamp.utcnow().isoformat()
+                    })
+                try:
+                    save_inventory_draft(draft_rows)
+                    draft_status.append(True)
+                except Exception as e:
+                    draft_status.append(False)
+                    st.warning(f"Bozza non salvata per {store}: {e}")
+
+        if draft_status and all(draft_status):
+            st.caption("💾 Bozza aggiornata automaticamente su Supabase")
+
+        col_salva, col_svuota = st.columns(2)
+        with col_salva:
+            salva_definitivo = st.button("Salva inventario definitivo", type="primary")
+        with col_svuota:
+            elimina_bozza = st.button("Azzera bozze del giorno")
+
+        if elimina_bozza:
+            for store in stores_visibili():
+                delete_inventory_draft(data_str, store)
+            st.success("Bozze eliminate.")
+            st.rerun()
+
+        if salva_definitivo:
             edited_all = pd.concat(edited_tables, ignore_index=True) if edited_tables else pd.DataFrame()
             rows = []
             for _, row in edited_all.iterrows():
-                rows.append({"data_inventario": data_str, "mese": mese, "anno": anno, "punto_vendita": str(row["punto_vendita"]), "codice": str(row["codice"]), "referenza": str(row["referenza"]), "tipo": str(row["tipo"]), "categoria": str(row["categoria"]), "unita": str(row["unita"]), "quantita": pulisci_numero(row.get("quantita", 0)), "prezzo_unitario": pulisci_numero(row.get("prezzo_unitario", 0)), "importo": pulisci_numero(row.get("importo", 0)) or (pulisci_numero(row.get("quantita", 0)) * pulisci_numero(row.get("prezzo_unitario", 0))), "note": str(row.get("note", ""))})
+                q = pulisci_numero(row.get("quantita", 0)); p = pulisci_numero(row.get("prezzo_unitario", 0))
+                rows.append({"data_inventario": data_str, "mese": mese, "anno": anno, "punto_vendita": str(row["punto_vendita"]), "codice": str(row["codice"]), "referenza": str(row["referenza"]), "tipo": str(row["tipo"]), "categoria": str(row["categoria"]), "unita": str(row["unita"]), "quantita": q, "prezzo_unitario": p, "importo": pulisci_numero(row.get("importo", 0)) or (q * p), "note": str(row.get("note", ""))})
             if rows:
                 for store in stores_visibili():
                     delete_inventory(data_str, store)
                 insert_rows("inventari", rows)
-                st.success("Inventario mensile salvato.")
+                for store in stores_visibili():
+                    delete_inventory_draft(data_str, store)
+                st.success("Inventario definitivo salvato. La bozza è stata rimossa.")
+                st.rerun()
+
         st.divider(); st.subheader("Inventari salvati")
         inventari = dedup_inventari_latest(fetch_table("inventari"))
         if inventari.empty:
